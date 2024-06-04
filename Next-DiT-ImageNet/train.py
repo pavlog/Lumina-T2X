@@ -45,6 +45,10 @@ from torchvision.datasets import ImageFolder
 from grad_norm import calculate_l2_grad_norm, get_model_parallel_dim_dict, scale_grad
 import models
 from transport import create_transport
+from random import shuffle
+from pathlib import Path
+from diffusers.utils import load_image
+import shutil
 
 #############################################################################
 #                           Training Helper Functions                       #
@@ -174,6 +178,106 @@ def setup_fsdp_sync(model: nn.Module, args: argparse.Namespace) -> FSDP:
 
     return model
 
+class DreamBoothDataset(torch.utils.data.Dataset):
+    def __init__( self, datasets_paths, vae):
+        import glob
+        from pathlib import Path
+        self.items = []
+        self.vae = vae
+        jpgFilenamesList = glob.glob(datasets_paths+"/*.json")
+        for path in jpgFilenamesList:
+            self.items.append(str(Path(path).with_suffix('')))
+        self.image_normalize = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        self.cache = {}
+        self.numOps = 7
+
+    def __len__(self):
+        return len(self.items)*self.numOps
+
+    def __getitem__(self, index):
+
+        if index==0:
+            self.index_shuf = list(range(len(self.items)*self.numOps))
+            shuffle(self.index_shuf)
+
+        batch = []
+        img_idx = index % (len(self.items)*self.numOps)
+        img_idx = self.index_shuf[img_idx]
+        img_idxBase = img_idx//self.numOps
+        if img_idxBase in self.cache:
+            return self.cache[img_idxBase][img_idx%self.numOps]
+        
+        imageOrg = load_image(self.items[img_idxBase]+".png")
+        imageOrg = self.image_normalize(imageOrg)
+        imageOrgFlip = transforms.functional.hflip(imageOrg)
+        imageOrg = imageOrg.unsqueeze(0).to(self.vae.device)
+        imageOrgFlip = imageOrgFlip.unsqueeze(0).to(self.vae.device)
+
+
+
+        basePath = Path(self.items[img_idxBase]+".png").with_suffix('')
+        outs = []
+        outs.append(str(basePath.parent/"05FW"/basePath.name)+"_raytrace.png")
+        outs.append(str(basePath.parent/"5DN"/basePath.name)+"_5DN_rti.png")
+        outs.append(str(basePath.parent/"5UP"/basePath.name)+"_5UP_rti.png")
+        outs.append(str(basePath.parent/"05SL"/basePath.name)+"_05SL_rti.png")
+        outs.append(str(basePath.parent/"05SR"/basePath.name)+"_05SR_rti.png")
+        imageRayTraces = []
+        for out in outs:
+            if os.path.exists(out):
+                img = load_image(out)
+                img = self.image_normalize(img)
+                imageRayTraces.append(img.unsqueeze(0).to(self.vae.device))
+            else:
+                assert False
+
+        with torch.no_grad():
+            imageOrg = self.vae.encode(imageOrg).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+            imageOrg = imageOrg.squeeze(0)
+            imageOrgFlip = self.vae.encode(imageOrgFlip).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+            imageOrgFlip = imageOrgFlip.squeeze(0)
+            for i  in range(len(imageRayTraces)):
+                latent = self.vae.encode(imageRayTraces[i]).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+                imageRayTraces[i] = latent.squeeze(0)
+        # 0-same (may be used for image enhacements)
+        # 1-move back
+        # 2-rotup 5
+        # 3-rotdn 5
+        # 4-strafe_r
+        # 5-strafe_l
+        ops = [1,2,3,4,5]
+        
+        # same
+        # may be augment with flip
+        # seems like it may add x4-5 more variations
+        example2 = {}
+        example2["target"] = imageOrg
+        example2["org"] = imageOrg
+        example2["class_id"] = 0
+        batch.append(example2)
+        # flipped
+        example2 = {}
+        example2["target"] = imageOrgFlip
+        example2["org"] = imageOrgFlip
+        example2["class_id"] = 0
+        batch.append(example2)
+
+        for i  in range(len(imageRayTraces)):
+            example2 = {}
+            example2["target"] = imageOrg
+            example2["org"] = imageRayTraces[i]
+            example2["class_id"] = ops[i]
+            batch.append(example2)
+
+        self.cache[img_idxBase] = batch
+
+        return batch[img_idx%self.numOps]
+
 
 def setup_mixed_precision(args):
     if args.precision == "tf32":
@@ -191,16 +295,27 @@ def setup_mixed_precision(args):
 
 
 def main(args):
+
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+
+    #torch.compiler.disable
     """
     Trains a new DiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup distributed env:
-    if any([x not in os.environ for x in ["RANK", "WORLD_SIZE", "MASTER_PORT", "MASTER_ADDR"]]):
-        setup_dist_env_from_slurm(args)
+    #if any([x not in os.environ for x in ["RANK", "WORLD_SIZE", "MASTER_PORT", "MASTER_ADDR"]]):
+    #    setup_dist_env_from_slurm(args)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    os.environ['RANK'] = '0'
+    os.environ['WORLD_SIZE'] = '1'
+    os.environ['NCCL_P2P_DISABLE']='1'
+    os.environ['TORCHDYNAMO_DISABLE']='1'
 
-    dist.init_process_group("nccl")
+    dist.init_process_group('gloo') #"nccl")
     fs_init.initialize_model_parallel(1)
 
     dp_world_size = fs_init.get_data_parallel_world_size()
@@ -349,6 +464,9 @@ def main(args):
     else:
         resume_step = 0
 
+    dataset = DreamBoothDataset(args.data_path,vae)
+ 
+    '''
     # Setup data:
     transform = transforms.Compose(
         [
@@ -359,18 +477,25 @@ def main(args):
         ]
     )
     dataset = ImageFolder(args.data_path, transform=transform)
+    '''
     num_samples = args.global_batch_size * args.max_steps
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
     logger.info(f"Total # samples to consume: {num_samples:,} " f"({num_samples / len(dataset):.2f} epochs)")
-    sampler = get_train_sampler(
-        dataset, dp_rank, dp_world_size, args.global_batch_size, args.max_steps, resume_step, args.global_seed
-    )
-    loader = DataLoader(
+    #sampler = get_train_sampler(
+    #    dataset, dp_rank, dp_world_size, args.global_batch_size, args.max_steps, resume_step, args.global_seed
+    #)
+    #loader = DataLoader(
+    #    dataset,
+    #    batch_size=local_batch_size,
+    #    sampler=sampler,
+    #    num_workers=args.num_workers,
+    #    pin_memory=True,
+    #)
+    loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=local_batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        batch_size=args.global_batch_size,
+        shuffle=False,
+        #collate_fn=lambda examples: collate_fn(examples, tokenizer),
     )
 
     # Prepare models for training:
@@ -382,171 +507,192 @@ def main(args):
     running_loss = 0
     running_task_loss = 0
     start_time = time()
-
+    step = resume_step
     logger.info(f"Training for {args.max_steps:,} steps...")
-    for step, (x, y) in enumerate(loader, start=resume_step):
-        x = x.to(device)
-        y = y.to(device)
-        with torch.no_grad():
-            # Map input images to latent space + normalize latents:
-            x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+    for epoch in range(1000):
+        for batch in enumerate(loader):
+            x = batch[1]["target"].to(device)
+            #x = target
+            org = batch[1]["org"].to(device)
+            y = batch[1]["class_id"].to(device)
 
-        if mp_world_size > 1:
-            mp_src = fs_init.get_model_parallel_src_rank()
-            mp_group = fs_init.get_model_parallel_group()
-            dist.broadcast(x, mp_src, mp_group)
-            dist.broadcast(y, mp_src, mp_group)
+            if mp_world_size > 1:
+                mp_src = fs_init.get_model_parallel_src_rank()
+                mp_group = fs_init.get_model_parallel_group()
+                dist.broadcast(x, mp_src, mp_group)
+                dist.broadcast(y, mp_src, mp_group)
 
-        loss_item = 0.0
-        task_loss_item = 0.0
-        opt.zero_grad()
-        for mb_idx in range((local_batch_size - 1) // args.micro_batch_size + 1):
-            mb_st = mb_idx * args.micro_batch_size
-            mb_ed = min((mb_idx + 1) * args.micro_batch_size, local_batch_size)
-            last_mb = mb_ed == local_batch_size
+            loss_item = 0.0
+            task_loss_item = 0.0
+            opt.zero_grad()
+            for mb_idx in range((local_batch_size - 1) // args.micro_batch_size + 1):
+                mb_st = mb_idx * args.micro_batch_size
+                mb_ed = min((mb_idx + 1) * args.micro_batch_size, local_batch_size)
+                last_mb = mb_ed == local_batch_size
 
-            x_mb = x[mb_st:mb_ed]
-            y_mb = y[mb_st:mb_ed]
+                x_mb = x[mb_st:mb_ed]
+                y_mb = y[mb_st:mb_ed]
 
-            model_kwargs = dict(y=y_mb)
-            with {
-                "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
-                "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
-                "fp32": contextlib.nullcontext(),
-                "tf32": contextlib.nullcontext(),
-            }[args.precision]:
-                loss_dict = transport.training_losses(model, x_mb, model_kwargs)
+                model_kwargs = dict(y=y_mb,input_latents=org)
+                with {
+                    "bf16": torch.cuda.amp.autocast(dtype=torch.bfloat16),
+                    "fp16": torch.cuda.amp.autocast(dtype=torch.float16),
+                    "fp32": contextlib.nullcontext(),
+                    "tf32": contextlib.nullcontext(),
+                }[args.precision]:
+                    loss_dict = transport.training_losses(model, x_mb, model_kwargs)
 
-                # loss_dict = diffusion.training_losses(
-                #    model, x_mb, t_mb, model_kwargs
-                # )
-            loss = loss_dict["loss"].sum() / local_batch_size
-            loss_item += loss.item()
-            task_loss_item += (loss_dict["task_loss"].sum() / local_batch_size).item()
-            with model.no_sync() if args.data_parallel in ["sdp", "hsdp"] and not last_mb else contextlib.nullcontext():
-                loss.backward()
+                    # loss_dict = diffusion.training_losses(
+                    #    model, x_mb, t_mb, model_kwargs
+                    # )
+                loss = loss_dict["loss"].sum() / local_batch_size
+                loss_item += loss.item()
+                task_loss_item += (loss_dict["task_loss"].sum() / local_batch_size).item()
+                with model.no_sync() if args.data_parallel in ["sdp", "hsdp"] and not last_mb else contextlib.nullcontext():
+                    loss.backward()
 
-        grad_norm = calculate_l2_grad_norm(model, model_parallel_dim_dict)
-        if grad_norm > args.grad_clip:
-            scale_grad(model, args.grad_clip / grad_norm)
+            grad_norm = calculate_l2_grad_norm(model, model_parallel_dim_dict)
+            if grad_norm > args.grad_clip:
+                scale_grad(model, args.grad_clip / grad_norm)
 
-        # if step % 10 == 0:
-        #     param_norm_dict = get_param_norm_dict(model, model_parallel_dim_dict)
-        # else:
-        #     param_norm_dict = {}
+            # if step % 10 == 0:
+            #     param_norm_dict = get_param_norm_dict(model, model_parallel_dim_dict)
+            # else:
+            #     param_norm_dict = {}
 
-        if tb_logger is not None:
-            tb_logger.add_scalar("train/loss", loss_item, step)
-            tb_logger.add_scalar("train/task_loss", task_loss_item, step)
-            tb_logger.add_scalar("train/grad_norm", grad_norm, step)
-            tb_logger.add_scalar("train/lr", opt.param_groups[0]["lr"], step)
-            for key, value in loss_dict.items():
-                if key != "loss" and value is not None:
-                    tb_logger.add_scalar(f"sub_loss/{key}", value.mean(), step)
-            # for key, value in param_norm_dict.items():
-            #     tb_logger.add_scalar(f"param_norm/{key}", value, step)
+            if tb_logger is not None:
+                tb_logger.add_scalar("train/loss", loss_item, step)
+                tb_logger.add_scalar("train/task_loss", task_loss_item, step)
+                tb_logger.add_scalar("train/grad_norm", grad_norm, step)
+                tb_logger.add_scalar("train/lr", opt.param_groups[0]["lr"], step)
+                for key, value in loss_dict.items():
+                    if key != "loss" and value is not None:
+                        tb_logger.add_scalar(f"sub_loss/{key}", value.mean(), step)
+                # for key, value in param_norm_dict.items():
+                #     tb_logger.add_scalar(f"param_norm/{key}", value, step)
 
-        opt.step()
-        update_ema(model_ema, model)
+            opt.step()
+            update_ema(model_ema, model)
 
-        # Log loss values:
-        running_loss += loss_item
-        running_task_loss += task_loss_item
-        log_steps += 1
-        if (step + 1) % args.log_every == 0:
-            # Measure training speed:
-            torch.cuda.synchronize()
-            end_time = time()
-            secs_per_step = (end_time - start_time) / log_steps
-            imgs_per_sec = args.global_batch_size * log_steps / (end_time - start_time)
-            # Reduce loss history over all processes:
-            avg_loss = torch.tensor(running_loss / log_steps, device=device)
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-            avg_loss = avg_loss.item() / dist.get_world_size()
+            # Log loss values:
+            running_loss += loss_item
+            running_task_loss += task_loss_item
+            log_steps += 1
+            step += 1
+            if (step + 1) % args.log_every == 0:
+                # Measure training speed:
+                torch.cuda.synchronize()
+                end_time = time()
+                secs_per_step = (end_time - start_time) / log_steps
+                imgs_per_sec = args.global_batch_size * log_steps / (end_time - start_time)
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / dist.get_world_size()
 
-            avg_task_loss = torch.tensor(running_task_loss / log_steps, device=device)
-            dist.all_reduce(avg_task_loss, op=dist.ReduceOp.SUM)
-            avg_task_loss = avg_task_loss.item() / dist.get_world_size()
+                avg_task_loss = torch.tensor(running_task_loss / log_steps, device=device)
+                dist.all_reduce(avg_task_loss, op=dist.ReduceOp.SUM)
+                avg_task_loss = avg_task_loss.item() / dist.get_world_size()
 
-            logger.info(
-                f"(step={step + 1:07d}) "
-                f"Train Loss: {avg_loss:.4f}, "
-                f"Train Task Loss: {avg_task_loss:.4f}, "
-                f"Train Secs/Step: {secs_per_step:.2f}, "
-                f"Train Imgs/Sec: {imgs_per_sec:.2f}"
-            )
-            # Reset monitoring variables:
-            running_loss = 0
-            running_task_loss = 0
-            log_steps = 0
-            start_time = time()
+                logger.info(
+                    f"(step={step + 1:07d}) "
+                    f"Train Loss: {avg_loss:.4f}, "
+                    f"Train Task Loss: {avg_task_loss:.4f}, "
+                    f"Train Secs/Step: {secs_per_step:.2f}, "
+                    f"Train Imgs/Sec: {imgs_per_sec:.2f}"
+                )
+                # Reset monitoring variables:
+                running_loss = 0
+                running_task_loss = 0
+                log_steps = 0
+                start_time = time()
 
-        # Save DiT checkpoint:
-        if (
-            # step == 0
-            (step + 1) % args.ckpt_every == 0
-            or (step + 1) == args.max_steps
-        ):
-            checkpoint_path = f"{checkpoint_dir}/{step + 1:07d}"
-            os.makedirs(checkpoint_path, exist_ok=True)
-
-            with FSDP.state_dict_type(
-                model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+            # Save DiT checkpoint:
+            if (
+                # step == 0
+                (step + 1) % args.ckpt_every == 0
+                or (step + 1) == args.max_steps
             ):
-                consolidated_model_state_dict = model.state_dict()
-                if fs_init.get_data_parallel_rank() == 0:
-                    consolidated_fn = (
-                        "consolidated."
-                        f"{fs_init.get_model_parallel_rank():02d}-of-"
-                        f"{fs_init.get_model_parallel_world_size():02d}"
-                        ".pth"
-                    )
-                    torch.save(
-                        consolidated_model_state_dict,
-                        os.path.join(checkpoint_path, consolidated_fn),
-                    )
-            dist.barrier()
-            del consolidated_model_state_dict
-            logger.info(f"Saved consolidated to {checkpoint_path}.")
 
-            with FSDP.state_dict_type(
-                model_ema,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
-            ):
-                consolidated_ema_state_dict = model_ema.state_dict()
-                if fs_init.get_data_parallel_rank() == 0:
-                    consolidated_ema_fn = (
-                        "consolidated_ema."
-                        f"{fs_init.get_model_parallel_rank():02d}-of-"
-                        f"{fs_init.get_model_parallel_world_size():02d}"
-                        ".pth"
-                    )
-                    torch.save(
-                        consolidated_ema_state_dict,
-                        os.path.join(checkpoint_path, consolidated_ema_fn),
-                    )
-            dist.barrier()
-            del consolidated_ema_state_dict
-            logger.info(f"Saved consolidated_ema to {checkpoint_path}.")
+                checkpoints_total_limit = 2
+                if checkpoints_total_limit is not None:
+                    checkpoints = os.listdir(checkpoint_dir)
+                    checkpoints = sorted(checkpoints, key=lambda x: int(x))
 
-            with FSDP.state_dict_type(
-                model_ema,
-                StateDictType.LOCAL_STATE_DICT,
-            ):
-                opt_state_fn = f"optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
-                torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
-            dist.barrier()
-            logger.info(f"Saved optimizer to {checkpoint_path}.")
+                    # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                    if len(checkpoints) >= checkpoints_total_limit:
+                        num_to_remove = len(checkpoints) - checkpoints_total_limit + 1
+                        removing_checkpoints = checkpoints[0:num_to_remove]
 
-            if dist.get_rank() == 0:
-                torch.save(args, os.path.join(checkpoint_path, "model_args.pth"))
-                with open(os.path.join(checkpoint_path, "resume_step.txt"), "w") as f:
-                    print(step + 1, file=f)
-            dist.barrier()
-            logger.info(f"Saved training arguments to {checkpoint_path}.")
+                        logger.info(
+                            f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                        )
+                        logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                        for removing_checkpoint in removing_checkpoints:
+                            removing_checkpoint = os.path.join(checkpoint_dir, removing_checkpoint)
+                            shutil.rmtree(removing_checkpoint, ignore_errors=True)
+
+                checkpoint_path = f"{checkpoint_dir}/{step + 1:07d}"
+                os.makedirs(checkpoint_path, exist_ok=True)
+
+                with FSDP.state_dict_type(
+                    model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    consolidated_model_state_dict = model.state_dict()
+                    if fs_init.get_data_parallel_rank() == 0:
+                        consolidated_fn = (
+                            "consolidated."
+                            f"{fs_init.get_model_parallel_rank():02d}-of-"
+                            f"{fs_init.get_model_parallel_world_size():02d}"
+                            ".pth"
+                        )
+                        torch.save(
+                            consolidated_model_state_dict,
+                            os.path.join(checkpoint_path, consolidated_fn),
+                        )
+                dist.barrier()
+                del consolidated_model_state_dict
+                logger.info(f"Saved consolidated to {checkpoint_path}.")
+
+                with FSDP.state_dict_type(
+                    model_ema,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+                ):
+                    consolidated_ema_state_dict = model_ema.state_dict()
+                    if fs_init.get_data_parallel_rank() == 0:
+                        consolidated_ema_fn = (
+                            "consolidated_ema."
+                            f"{fs_init.get_model_parallel_rank():02d}-of-"
+                            f"{fs_init.get_model_parallel_world_size():02d}"
+                            ".pth"
+                        )
+                        torch.save(
+                            consolidated_ema_state_dict,
+                            os.path.join(checkpoint_path, consolidated_ema_fn),
+                        )
+                dist.barrier()
+                del consolidated_ema_state_dict
+                logger.info(f"Saved consolidated_ema to {checkpoint_path}.")
+
+                with FSDP.state_dict_type(
+                    model_ema,
+                    StateDictType.LOCAL_STATE_DICT,
+                ):
+                    opt_state_fn = f"optimizer.{dist.get_rank():05d}-of-" f"{dist.get_world_size():05d}.pth"
+                    torch.save(opt.state_dict(), os.path.join(checkpoint_path, opt_state_fn))
+                dist.barrier()
+                logger.info(f"Saved optimizer to {checkpoint_path}.")
+
+                if dist.get_rank() == 0:
+                    torch.save(args, os.path.join(checkpoint_path, "model_args.pth"))
+                    with open(os.path.join(checkpoint_path, "resume_step.txt"), "w") as f:
+                        print(step + 1, file=f)
+                dist.barrier()
+                logger.info(f"Saved training arguments to {checkpoint_path}.")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -556,13 +702,37 @@ def main(args):
 
 
 if __name__ == "__main__":
+
+    import sys
+    sys.argv.extend([
+                    "--data_path=D:/Projects/InpaintDataBase/Batch3D_001",
+                    "--results_dir=./results",
+                    "--model=DiT_Llama_7B_patch2_Actions",
+                    "--image_size=512",
+                    "--vae=mse",
+                    "--num_workers=1",
+                    "--log_every=10",
+                    "--ckpt_every=500",
+                    "--global_batch_size=12", #10",
+                    "--micro_batch_size=12",
+                    #"--resume",
+                    "--num_classes=100",
+                    "--snr_type=lognorm",
+                    "--grad_precision=fp32",
+                    "--precision=bf16",
+                    "--qk_norm",
+                    "--lr=5e-4",
+                    "--data_parallel=fsdp",
+                    ])
+
+
     mp.set_start_method("spawn")
     # Default args here will train DiT_Llama2_7B_patch2 with the
     # hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--results_dir", type=str, required=True)
-    parser.add_argument("--model", type=str, default="DiT_Llama2_7B_patch2")
+    parser.add_argument("--model", type=str)
     parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num_classes", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=100_000, help="Number of training steps.")

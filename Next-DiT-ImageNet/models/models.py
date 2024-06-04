@@ -854,11 +854,12 @@ class DiT_Llama(nn.Module):
         num_classes: int = 1000,
         learn_sigma: bool = True,
         qk_norm: bool = False,
+        out_channels=4,
     ) -> None:
         super().__init__()
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = out_channels * 2 if learn_sigma else out_channels
         self.input_size = input_size
         self.patch_size = patch_size
 
@@ -917,7 +918,7 @@ class DiT_Llama(nn.Module):
 
         return x, H // pH, W // pW, self.freqs_cis[: H // pH, : W // pW].flatten(0, 1).unsqueeze(0)
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, input_latents):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent
@@ -925,6 +926,8 @@ class DiT_Llama(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        if input_latents!=None:
+            x = torch.cat([x,input_latents],dim=1)
 
         x, H, W, freqs_cis = self.patchify(x)
         freqs_cis = freqs_cis.to(x.device)
@@ -943,7 +946,7 @@ class DiT_Llama(nn.Module):
             x, _ = x.chunk(2, dim=1)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, rope_scaling_factor=None, ntk_factor=None):
+    def forward_with_cfg(self, x, t, y, input_latents, cfg_scale, rope_scaling_factor=None, ntk_factor=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass
         for classifier-free guidance.
@@ -962,7 +965,8 @@ class DiT_Llama(nn.Module):
 
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        combinedLats = torch.cat([input_latents, input_latents], dim=0)
+        model_out = self.forward(combined, t, y,combinedLats)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -1053,3 +1057,7 @@ def DiT_Llama_3B_patch2(**kwargs):
 
 def DiT_Llama_7B_patch2(**kwargs):
     return DiT_Llama(patch_size=2, dim=4096, n_layers=32, n_heads=32, **kwargs)
+
+#    return DiT(input_size=64,in_channels=8,depth=32, hidden_size=1152, patch_size=2, num_heads=16,num_classes=100,out_channels=4)
+def DiT_Llama_7B_patch2_Actions(**kwargs):
+    return DiT_Llama(in_channels=8,patch_size=2, dim=1536, n_layers=16, n_heads=32,out_channels=4,**kwargs)

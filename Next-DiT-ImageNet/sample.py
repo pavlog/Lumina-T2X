@@ -23,6 +23,8 @@ from torchvision.utils import save_image
 
 import models
 from transport import Sampler, create_transport
+from diffusers.utils import load_image
+from torchvision import transforms
 
 
 def none_or_str(value):
@@ -76,6 +78,14 @@ def parse_sde_args(parser):
 
 
 def main(args, rank, master_port):
+    image_normalize = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
@@ -84,20 +94,27 @@ def main(args, rank, master_port):
     os.environ["WORLD_SIZE"] = str(args.num_gpus)
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ['TORCHDYNAMO_DISABLE']='1'
 
-    dist.init_process_group("nccl")
+    dist.init_process_group("gloo")
     fs_init.initialize_model_parallel(args.num_gpus)
     torch.cuda.set_device(rank)
 
-    train_args = torch.load(os.path.join(args.ckpt, "model_args.pth"))
+    # assert train_args.model_parallel_size == args.num_gpus
+    dirs = os.listdir(args.ckpt)
+    dirs = sorted(dirs, key=lambda x: int(x))
+    path = dirs[-1] if len(dirs) > 0 else None
+    ckpt_path = os.path.join(args.ckpt, path)
+
+    train_args = torch.load(os.path.join(ckpt_path, "model_args.pth"))
 
     if dist.get_rank() == 0:
         print("Model arguments used for inference:", json.dumps(train_args.__dict__, indent=2))
 
     # Load model:
     image_size = train_args.image_size
-    # latent_size = image_size // 8
-    latent_size = image_size // 4
+    latent_size = image_size // 8
+    #latent_size = image_size // 4
     model = models.__dict__[train_args.model](
         input_size=latent_size,
         num_classes=train_args.num_classes,
@@ -115,20 +132,29 @@ def main(args, rank, master_port):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # assert train_args.model_parallel_size == args.num_gpus
+
+
     ckpt = torch.load(
         os.path.join(
-            args.ckpt,
+            ckpt_path,
             f"consolidated{'_ema' if args.ema else ''}." f"{rank:02d}-of-{args.num_gpus:02d}.pth",
         ),
         map_location="cpu",
     )
     model.load_state_dict(ckpt, strict=True)
 
+    train_steps = 0
+    with open(os.path.join(ckpt_path, "resume_step.txt")) as f:
+        train_steps = int(f.read().strip())
+
     model.eval()  # important!
 
     transport = create_transport(args.path_type, args.prediction, args.loss_weight, args.train_eps, args.sample_eps)
     sampler = Sampler(transport)
+
+    import shutil
+    shutil.copy("D:/Projects/sdexperiments/PointsInpaint/Test1/river19_0000_0002.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+
 
     if mode == "ODE":
         if args.likelihood:
@@ -164,43 +190,65 @@ def main(args, rank, master_port):
         else os.path.join(args.local_diffusers_model_root, f"stabilityai/sd-vae-ft-{train_args.vae}")
     ).cuda()
 
-    # Create sampling noise:
-    n = len(args.class_labels)
-    z = torch.randn(
-        n,
-        4,
-        latent_size,
-        latent_size,
-        dtype=torch_dtype,
-        device="cuda",
-    )
-    y = torch.tensor(args.class_labels, device="cuda")
+    org_latents = None
+    for i in range(10):
 
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device="cuda")
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+        if org_latents==None:
+            imageOrg = load_image(args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_{i}.png")
+            #
+            #    #"D:\Projects\InpaintDataBase\Batch001_Train\cave_0006_0063.png")
+            #"D:/Projects/sdexperiments/PointsInpaint/Test1/river19_0000_0002.png"
+            ##"sample_61000_1a.png"
+            #)
+            imageOrg = image_normalize(imageOrg)
+            imageOrg = imageOrg.unsqueeze(0)
+            #imageOrg = imageOrg.repeat(n, 1, 1, 1) 
+            imageOrg = imageOrg.to( device="cuda")
+            org_latents = vae.encode(imageOrg).latent_dist.sample().mul_(vae.config.scaling_factor)
+        else:
+            org_latents = org_latents
 
-    # Sample images:
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
-    # samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    # samples = vae.decode(samples / 0.18215).sample
-
-    if rank == 0:
-        samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-        samples = vae.decode(samples / 0.18215).sample
-
-        # Save and display images:
-        save_image(
-            samples,
-            args.image_save_path or os.path.join(args.ckpt, f"sample{'_ema' if args.ema else ''}.png"),
-            nrow=8,
-            normalize=True,
-            value_range=(-1, 1),
+        # Create sampling noise:
+        n = len(args.class_labels)
+        z = torch.randn(
+            n,
+            4,
+            latent_size,
+            latent_size,
+            dtype=torch_dtype,
+            device="cuda",
         )
+        y = torch.tensor(args.class_labels, device="cuda")
 
-    dist.barrier()
+        input_latents = org_latents
+
+        # Setup classifier-free guidance:
+        #z = torch.cat([z, z], 0)
+        #y_null = torch.tensor([1000] * n, device="cuda")
+        #y = torch.cat([y, y_null], 0)
+        model_kwargs = dict(y=y,input_latents = input_latents)#,cfg_scale=args.cfg_scale)
+
+        # Sample images:
+        #samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
+        samples = sample_fn(z, model.forward, **model_kwargs)[-1]
+        # samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        # samples = vae.decode(samples / 0.18215).sample
+
+        if rank == 0:
+            #samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+            org_latents = samples
+            samples = vae.decode(samples / 0.18215).sample
+
+            # Save and display images:
+            save_image(
+                samples,
+                args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_{i+1}.png",
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1),
+            )
+
+        dist.barrier()
 
 
 def find_free_port() -> int:
@@ -212,6 +260,14 @@ def find_free_port() -> int:
 
 
 if __name__ == "__main__":
+
+    sys.argv.extend([
+                "--model=DiT_Llama_7B_patch2_Actions",
+                "--ckpt=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results/checkpoints/",
+                "--image_save_path=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results",
+                ])
+
+
     parser = argparse.ArgumentParser()
     mode = sys.argv[1]
     if mode not in ["ODE", "SDE"]:
@@ -226,7 +282,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         help="Class labels to generate the images for.",
-        default=[207, 360, 387, 974, 88, 979, 417, 279],
+        default=[0],
     )
     parser.add_argument(
         "--precision",

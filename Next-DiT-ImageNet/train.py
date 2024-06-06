@@ -510,6 +510,7 @@ def main(args):
     step = resume_step
     logger.info(f"Training for {args.max_steps:,} steps...")
     for epoch in range(1000):
+        logger.info(f"Beginning epoch {epoch}...")
         for batch in enumerate(loader):
             x = batch[1]["target"].to(device)
             #x = target
@@ -713,8 +714,8 @@ if __name__ == "__main__":
                     "--num_workers=1",
                     "--log_every=10",
                     "--ckpt_every=500",
-                    "--global_batch_size=12", #10",
-                    "--micro_batch_size=12",
+                    "--global_batch_size=16", #10",
+                    "--micro_batch_size=16",
                     #"--resume",
                     "--num_classes=100",
                     "--snr_type=lognorm",

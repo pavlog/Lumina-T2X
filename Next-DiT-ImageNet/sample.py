@@ -282,7 +282,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         help="Class labels to generate the images for.",
-        default=[0],
+        default=[1],
     )
     parser.add_argument(
         "--precision",

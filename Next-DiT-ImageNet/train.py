@@ -237,12 +237,20 @@ class DreamBoothDataset(torch.utils.data.Dataset):
                 assert False
 
         with torch.no_grad():
-            imageOrg = self.vae.encode(imageOrg).latent_dist.sample().mul_(self.vae.config.scaling_factor)
-            imageOrg = imageOrg.squeeze(0)
-            imageOrgFlip = self.vae.encode(imageOrgFlip).latent_dist.sample().mul_(self.vae.config.scaling_factor)
-            imageOrgFlip = imageOrgFlip.squeeze(0)
+            # org
+            imageOrgDist = self.vae.encode(imageOrg).latent_dist
+            imageOrgMode = imageOrgDist.mode()
+            imageOrgSample = imageOrgDist.sample().mul_(self.vae.config.scaling_factor)
+            imageOrgMode = imageOrgMode.squeeze(0)
+            imageOrgSample = imageOrgSample.squeeze(0)
+            # flip
+            imageOrgFlipDist = self.vae.encode(imageOrgFlip).latent_dist
+            imageOrgFlipMode = imageOrgFlipDist.mode()
+            imageOrgFlipSample = imageOrgFlipDist.sample().mul_(self.vae.config.scaling_factor)
+            imageOrgFlipMode = imageOrgFlipMode.squeeze(0)
+            imageOrgFlipSample = imageOrgFlipSample.squeeze(0)
             for i  in range(len(imageRayTraces)):
-                latent = self.vae.encode(imageRayTraces[i]).latent_dist.sample().mul_(self.vae.config.scaling_factor)
+                latent = self.vae.encode(imageRayTraces[i]).latent_dist.mode() #sample().mul_(self.vae.config.scaling_factor)
                 imageRayTraces[i] = latent.squeeze(0)
         # 0-same (may be used for image enhacements)
         # 1-move back
@@ -256,20 +264,20 @@ class DreamBoothDataset(torch.utils.data.Dataset):
         # may be augment with flip
         # seems like it may add x4-5 more variations
         example2 = {}
-        example2["target"] = imageOrg
-        example2["org"] = imageOrg
+        example2["target"] = imageOrgSample
+        example2["org"] = imageOrgMode
         example2["class_id"] = 0
         batch.append(example2)
         # flipped
         example2 = {}
-        example2["target"] = imageOrgFlip
-        example2["org"] = imageOrgFlip
+        example2["target"] = imageOrgFlipSample
+        example2["org"] = imageOrgFlipMode
         example2["class_id"] = 0
         batch.append(example2)
 
         for i  in range(len(imageRayTraces)):
             example2 = {}
-            example2["target"] = imageOrg
+            example2["target"] = imageOrgSample
             example2["org"] = imageRayTraces[i]
             example2["class_id"] = ops[i]
             batch.append(example2)
@@ -707,15 +715,17 @@ if __name__ == "__main__":
     import sys
     sys.argv.extend([
                     "--data_path=D:/Projects/InpaintDataBase/Batch3D_001",
-                    "--results_dir=./results",
-                    "--model=DiT_Llama_7B_patch2_Actions",
+                    #"--results_dir=./results",
+                    #"--model=DiT_Llama_7B_patch2_Actions",
+                    "--results_dir=./results2",
+                    "--model=DiT_Llama_600_patch2_Actions2",
                     "--image_size=512",
                     "--vae=mse",
                     "--num_workers=1",
-                    "--log_every=10",
-                    "--ckpt_every=500",
-                    "--global_batch_size=16", #10",
-                    "--micro_batch_size=16",
+                    "--log_every=5",
+                    "--ckpt_every=100",
+                    "--global_batch_size=32", #10",
+                    "--micro_batch_size=32",
                     #"--resume",
                     "--num_classes=100",
                     "--snr_type=lognorm",
@@ -724,6 +734,7 @@ if __name__ == "__main__":
                     "--qk_norm",
                     "--lr=5e-4",
                     "--data_parallel=fsdp",
+                    "--global_seed=2",
                     ])
 
 

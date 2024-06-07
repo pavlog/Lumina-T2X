@@ -163,3 +163,4 @@ cython_debug/
 test_*
 
 results/
+Next-DiT-ImageNet/results2/

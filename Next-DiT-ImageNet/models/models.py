@@ -1038,6 +1038,250 @@ class DiT_Llama(nn.Module):
         return list(self.layers)
 
 
+class DiT_LlamaP2P(nn.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+
+    def __init__(
+        self,
+        input_size: int = 32,
+        patch_size: int = 2,
+        in_channels: int = 4,
+        dim: int = 4096,
+        n_layers: int = 32,
+        n_heads: int = 32,
+        n_kv_heads: Optional[int] = None,
+        multiple_of: int = 256,
+        ffn_dim_multiplier: Optional[float] = None,
+        norm_eps: float = 1e-5,
+        class_dropout_prob: float = 0.1,
+        num_classes: int = 1000,
+        learn_sigma: bool = True,
+        qk_norm: bool = False,
+        out_channels=4,
+    ) -> None:
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = out_channels * 2 if learn_sigma else out_channels
+        self.input_size = input_size
+        self.patch_size = patch_size
+
+        self.x_embedder = ColumnParallelLinear(
+            in_features=patch_size * patch_size * in_channels,
+            out_features=dim,
+            bias=True,
+            gather_output=True,
+            init_method=nn.init.xavier_uniform_,
+        )
+        nn.init.constant_(self.x_embedder.bias, 0.0)
+
+        self.x_embedder2 = ColumnParallelLinear(
+            in_features=patch_size * patch_size * in_channels,
+            out_features=dim,
+            bias=True,
+            gather_output=True,
+            init_method=nn.init.xavier_uniform_,
+        )
+        nn.init.constant_(self.x_embedder2.bias, 0.0)
+
+        self.t_embedder = ParallelTimestepEmbedder(min(dim, 1024))
+        self.y_embedder = ParallelLabelEmbedder(num_classes, min(dim, 1024), class_dropout_prob)
+
+        preLayers = 4
+        self.layersPre = nn.ModuleList(
+            [
+                TransformerBlockSandwichNorm2(
+                    layer_id, dim, n_heads, n_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, qk_norm
+                )
+                for layer_id in range(preLayers)
+            ]
+        )
+
+        self.layers2 = nn.ModuleList(
+            [
+                TransformerBlockSandwichNorm2(
+                    layer_id, dim, n_heads, n_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, qk_norm
+                )
+                for layer_id in range(preLayers)
+            ]
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlockSandwichNorm2(
+                    layer_id, dim, n_heads, n_kv_heads, multiple_of, ffn_dim_multiplier, norm_eps, qk_norm
+                )
+                for layer_id in range(n_layers)
+            ]
+        )
+        
+        self.final_layer = ParallelFinalLayer(dim, patch_size, self.out_channels)
+
+        assert (dim // n_heads) % 4 == 0, "2d rope needs head dim to be divisible by 4"
+        self.freqs_cis = DiT_Llama.precompute_freqs_cis(
+            dim // n_heads,
+            384,
+            # theta=100.
+        )
+
+        self.dim = dim
+        self.n_heads = n_heads
+
+    def unpatchify(self, x: torch.Tensor, H, W) -> torch.Tensor:
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, C, H, W)
+        """
+        B = x.shape[0]
+        C = self.out_channels
+        P = self.patch_size
+
+        x = x.reshape(shape=(B, H, W, P, P, C))
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        imgs = x.reshape(shape=(B, C, H * P, W * P))
+        return imgs
+
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.size()
+        # assert (H, W) == (self.input_size, self.input_size)
+        pH = pW = self.patch_size
+        x = x.view(B, C, H // pH, pH, W // pW, pW)
+        x = x.permute(0, 2, 4, 1, 3, 5).flatten(-3).flatten(1, 2)
+
+        return x, H // pH, W // pW, self.freqs_cis[: H // pH, : W // pW].flatten(0, 1).unsqueeze(0)
+
+    def forward(self, x, t, y, input_latents):
+        """
+        Forward pass of DiT.
+        x: (N, C, H, W) tensor of spatial inputs (images or latent
+           representations of images)
+        t: (N,) tensor of diffusion timesteps
+        y: (N,) tensor of class labels
+        """
+        x, H, W, freqs_cis = self.patchify(x)
+        freqs_cis = freqs_cis.to(x.device)
+        x = self.x_embedder(x)
+
+        x2, H2, W2, freqs_cis2 = self.patchify(input_latents)
+        freqs_cis2 = freqs_cis2.to(input_latents.device)
+        x2 = self.x_embedder2(x2)
+
+        t = self.t_embedder(t)  # (N, D)
+        y = self.y_embedder(y, self.training)  # (N, D)
+        adaln_input = t + y
+
+
+        for layer in self.layersPre:
+            x = layer(x, freqs_cis, adaln_input=adaln_input)
+
+        for layer in self.layers2:
+            x2 = layer(x2, freqs_cis2, adaln_input=y)
+
+        x = x + x2
+
+        for layer in self.layers:
+            x = layer(x, freqs_cis, adaln_input=adaln_input)
+
+        x = self.final_layer(x, adaln_input)
+        x = self.unpatchify(x, H, W)  # (N, out_channels, H, W)
+        if self.learn_sigma:
+            x, _ = x.chunk(2, dim=1)
+        return x
+
+    def forward_with_cfg(self, x, t, y, input_latents, cfg_scale, rope_scaling_factor=None, ntk_factor=None):
+        """
+        Forward pass of DiT, but also batches the unconditional forward pass
+        for classifier-free guidance.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+
+        if rope_scaling_factor is not None or ntk_factor is not None:
+            assert rope_scaling_factor is not None and ntk_factor is not None
+            # print("override freqs_cis", flush=True)
+            self.freqs_cis = DiT_Llama.precompute_freqs_cis(
+                self.dim // self.n_heads, 384, rope_scaling_factor=rope_scaling_factor, ntk_factor=ntk_factor
+            )
+        else:
+            pass
+            # print("use original freqs_cis", flush=True)
+
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        combinedLats = torch.cat([input_latents, input_latents], dim=0)
+        model_out = self.forward(combined, t, y,combinedLats)
+        # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # three channels by default. The standard approach to cfg applies it to all channels.
+        # This can be done by uncommenting the following line and commenting-out the line following that.
+        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
+    @staticmethod
+    def precompute_freqs_cis(
+        dim: int, end: int, theta: float = 10000.0, rope_scaling_factor: float = 1.0, ntk_factor: float = 1.0
+    ):
+        """
+        Precompute the frequency tensor for complex exponentials (cis) with
+        given dimensions.
+
+        This function calculates a frequency tensor with complex exponentials
+        using the given dimension 'dim' and the end index 'end'. The 'theta'
+        parameter scales the frequencies. The returned tensor contains complex
+        values in complex64 data type.
+
+        Args:
+            dim (int): Dimension of the frequency tensor.
+            end (int): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation.
+                Defaults to 10000.0.
+
+        Returns:
+            torch.Tensor: Precomputed frequency tensor with complex
+                exponentials.
+        """
+
+        theta = theta * ntk_factor
+
+        logger.info(f"theta {theta} rope scaling {rope_scaling_factor} ntk {ntk_factor}")
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+        t = torch.arange(end, device=freqs.device, dtype=torch.float)  # type: ignore
+        t = t / rope_scaling_factor
+        freqs = torch.outer(t, freqs).float()  # type: ignore
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
+        freqs_cis_h = freqs_cis.view(end, 1, dim // 4, 1).repeat(1, end, 1, 1)
+        freqs_cis_w = freqs_cis.view(1, end, dim // 4, 1).repeat(end, 1, 1, 1)
+        freqs_cis = torch.cat([freqs_cis_h, freqs_cis_w], dim=-1).flatten(2)
+        return freqs_cis
+
+    def parameter_count(self) -> int:
+        tensor_parallel_module_list = (
+            ColumnParallelLinear,
+            RowParallelLinear,
+            ParallelEmbedding,
+        )
+        total_params = 0
+
+        def _recursive_count_params(module):
+            nonlocal total_params
+            is_tp_module = isinstance(module, tensor_parallel_module_list)
+            for param in module.parameters(recurse=False):
+                total_params += param.numel() * (fs_init.get_model_parallel_world_size() if is_tp_module else 1)
+            for submodule in module.children():
+                _recursive_count_params(submodule)
+
+        _recursive_count_params(self)
+        return total_params
+
+    def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
+        return list(self.layers)
+
+
 #############################################################################
 #                                 DiT Configs                               #
 #############################################################################
@@ -1061,3 +1305,46 @@ def DiT_Llama_7B_patch2(**kwargs):
 #    return DiT(input_size=64,in_channels=8,depth=32, hidden_size=1152, patch_size=2, num_heads=16,num_classes=100,out_channels=4)
 def DiT_Llama_7B_patch2_Actions(**kwargs):
     return DiT_Llama(in_channels=8,patch_size=2, dim=1536, n_layers=16, n_heads=32,out_channels=4,**kwargs)
+
+def DiT_Llama_600_patch2_Actions2(**kwargs):
+    return DiT_LlamaP2P(in_channels=4,patch_size=2, dim=512, n_layers=12, n_heads=32,out_channels=4,**kwargs)
+
+
+if __name__ == "__main__":
+    import torch._dynamo
+    import os
+    torch._dynamo.config.suppress_errors = True
+
+    #torch.compiler.disable
+    """
+    Trains a new DiT model.
+    """
+    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+
+    # Setup distributed env:
+    #if any([x not in os.environ for x in ["RANK", "WORLD_SIZE", "MASTER_PORT", "MASTER_ADDR"]]):
+    #    setup_dist_env_from_slurm(args)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12359'
+    os.environ['RANK'] = '0'
+    os.environ['WORLD_SIZE'] = '1'
+    os.environ['NCCL_P2P_DISABLE']='1'
+    os.environ['TORCHDYNAMO_DISABLE']='1'
+
+    dist.init_process_group('gloo') #"nccl")
+    fs_init.initialize_model_parallel(1)
+    model = DiT_LlamaP2P(in_channels=4,patch_size=2, dim=1536, n_layers=12, n_heads=32,out_channels=4,num_classes=100,qk_norm=True)
+    model.to("cuda")
+    print(f"DiT Parameters: {model.parameter_count():,}")
+    image = torch.randn(1, 4, 512//8, 512//8)
+    imageOrg = torch.randn(1, 4, 512//8, 512//8)
+    class_labels = [0]
+    y = torch.tensor(class_labels, device="cuda")
+    image = image.cuda()
+    imageOrg = imageOrg.cuda()
+    t = torch.randint(0, 500, (image.shape[0],), device="cuda")
+    with torch.no_grad():
+        output = model(image,t,y,imageOrg)
+    print(output.size())
+    print(output[0].size())
+

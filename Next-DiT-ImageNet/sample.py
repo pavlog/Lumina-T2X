@@ -9,6 +9,8 @@
 """
 Sample new images from a pre-trained DiT.
 """
+import sys
+sys.path.insert(0,"D:/Projects/diffusers/src")
 import argparse
 import json
 import os
@@ -154,6 +156,11 @@ def main(args, rank, master_port):
 
     import shutil
     shutil.copy("D:/Projects/sdexperiments/PointsInpaint/Test1/river19_0000_0002.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+    #shutil.copy("D:/Projects/InpaintDataBase/Batch3D_002/river98_0001.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+    #shutil.copy("results/testNoise.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+    #shutil.copy("D:/Projects/InpaintDataBase/Batch3D_002/05SL/river75_0008_05SL_rti.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+    
+    
 
 
     if mode == "ODE":
@@ -204,7 +211,7 @@ def main(args, rank, master_port):
             imageOrg = imageOrg.unsqueeze(0)
             #imageOrg = imageOrg.repeat(n, 1, 1, 1) 
             imageOrg = imageOrg.to( device="cuda")
-            org_latents = vae.encode(imageOrg).latent_dist.sample().mul_(vae.config.scaling_factor)
+            org_latents = vae.encode(imageOrg).latent_dist.mode() #sample().mul_(vae.config.scaling_factor)
         else:
             org_latents = org_latents
 
@@ -236,7 +243,8 @@ def main(args, rank, master_port):
 
         if rank == 0:
             #samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-            org_latents = samples
+            #org_latents = samples
+            org_latents = None
             samples = vae.decode(samples / 0.18215).sample
 
             # Save and display images:
@@ -265,6 +273,8 @@ if __name__ == "__main__":
                 "--model=DiT_Llama_7B_patch2_Actions",
                 "--ckpt=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results/checkpoints/",
                 "--image_save_path=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results",
+                "--atol=1e-6",
+                "--rtol=1e-3",
                 ])
 
 
@@ -273,7 +283,7 @@ if __name__ == "__main__":
     if mode not in ["ODE", "SDE"]:
         mode = "ODE"
 
-    parser.add_argument("--cfg_scale", type=float, default=4.0)
+    parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--num_sampling_steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, required=True)

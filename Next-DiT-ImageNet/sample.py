@@ -270,9 +270,14 @@ def find_free_port() -> int:
 if __name__ == "__main__":
 
     sys.argv.extend([
-                "--model=DiT_Llama_7B_patch2_Actions",
-                "--ckpt=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results/checkpoints/",
-                "--image_save_path=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results",
+                #"--model=DiT_Llama_7B_patch2_Actions",
+                #"--ckpt=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results/checkpoints/",
+                #"--image_save_path=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results",
+
+                "--image_save_path=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results2",
+                "--ckpt=D:/Projects/Lumina-T2X/Next-DiT-ImageNet/results2/checkpoints/",
+                "--model=DiT_Llama_600_patch2_Actions2",
+
                 "--atol=1e-6",
                 "--rtol=1e-3",
                 ])
@@ -292,7 +297,7 @@ if __name__ == "__main__":
         type=int,
         nargs="+",
         help="Class labels to generate the images for.",
-        default=[1],
+        default=[0],
     )
     parser.add_argument(
         "--precision",

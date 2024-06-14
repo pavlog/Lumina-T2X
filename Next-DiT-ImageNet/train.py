@@ -20,6 +20,7 @@ import os
 import socket
 import subprocess
 from time import sleep, time
+import shutil
 
 from PIL import Image
 from diffusers.models import AutoencoderKL
@@ -49,7 +50,8 @@ from random import shuffle
 from pathlib import Path
 from diffusers.utils import load_image
 import shutil
-
+import hashlib
+import SamplePipeline
 #############################################################################
 #                           Training Helper Functions                       #
 #############################################################################
@@ -184,6 +186,7 @@ class DreamBoothDataset(torch.utils.data.Dataset):
         from pathlib import Path
         self.items = []
         self.vae = vae
+        self.datasets_paths = datasets_paths
         jpgFilenamesList = glob.glob(datasets_paths+"/*.json")
         for path in jpgFilenamesList:
             self.items.append(str(Path(path).with_suffix('')))
@@ -194,97 +197,131 @@ class DreamBoothDataset(torch.utils.data.Dataset):
             ]
         )
         self.cache = {}
-        self.numOps = 7
+        self.numOps = 7+1+1+1+1+1+1+1+1
+        self.zero_img = None
 
     def __len__(self):
         return len(self.items)*self.numOps
+    
+    def getLatents(self,filename,flip=False):
+        basePath = Path(filename).with_suffix('')
+        relPath = os.path.relpath(filename, self.datasets_paths)
+        hash = hashlib.md5((str(relPath)+str(flip)).encode("UTF-8")).hexdigest()
+        npmode = str(self.datasets_paths+"/Cache/")+str(hash)+"_m.npy"
+        npsamples = str(self.datasets_paths+"/Cache/")+str(hash)+"_s.npy"
+        if os.path.exists(npmode) and os.path.exists(npsamples):
+            imageOrgMode =  torch.from_numpy(np.load(npmode)).to(self.vae.device)
+            imageOrgSamples =  torch.from_numpy(np.load(npsamples)).to(self.vae.device)
+            return imageOrgMode,imageOrgSamples
+
+        imageOrg = load_image(filename)
+        imageOrg = self.image_normalize(imageOrg)
+        if flip:
+            imageOrg = transforms.functional.hflip(imageOrg)
+        imageOrg = imageOrg.unsqueeze(0).to(self.vae.device)
+        imageOrgDist = self.vae.encode(imageOrg).latent_dist
+        imageOrgMode = imageOrgDist.mode()
+        imageOrgSample = imageOrgDist.sample().mul_(self.vae.config.scaling_factor)
+        imageOrgMode = imageOrgMode.squeeze(0)
+        imageOrgSample = imageOrgSample.squeeze(0)
+
+        imageOrgModeCpu = imageOrgMode.detach().cpu().numpy()    # (4, 64, 64)
+        np.save(npmode, imageOrgModeCpu)
+        imageOrgSampleCpu = imageOrgSample.detach().cpu().numpy()    # (4, 64, 64)
+        np.save(npsamples, imageOrgSampleCpu)
+
+        return imageOrgMode,imageOrgSample
+
+
+
 
     def __getitem__(self, index):
 
-        if index==0:
-            self.index_shuf = list(range(len(self.items)*self.numOps))
-            shuffle(self.index_shuf)
-
-        batch = []
-        img_idx = index % (len(self.items)*self.numOps)
-        img_idx = self.index_shuf[img_idx]
-        img_idxBase = img_idx//self.numOps
-        if img_idxBase in self.cache:
-            return self.cache[img_idxBase][img_idx%self.numOps]
-        
-        imageOrg = load_image(self.items[img_idxBase]+".png")
-        imageOrg = self.image_normalize(imageOrg)
-        imageOrgFlip = transforms.functional.hflip(imageOrg)
-        imageOrg = imageOrg.unsqueeze(0).to(self.vae.device)
-        imageOrgFlip = imageOrgFlip.unsqueeze(0).to(self.vae.device)
-
-
-
-        basePath = Path(self.items[img_idxBase]+".png").with_suffix('')
-        outs = []
-        outs.append(str(basePath.parent/"05FW"/basePath.name)+"_raytrace.png")
-        outs.append(str(basePath.parent/"5DN"/basePath.name)+"_5DN_rti.png")
-        outs.append(str(basePath.parent/"5UP"/basePath.name)+"_5UP_rti.png")
-        outs.append(str(basePath.parent/"05SL"/basePath.name)+"_05SL_rti.png")
-        outs.append(str(basePath.parent/"05SR"/basePath.name)+"_05SR_rti.png")
-        imageRayTraces = []
-        for out in outs:
-            if os.path.exists(out):
-                img = load_image(out)
-                img = self.image_normalize(img)
-                imageRayTraces.append(img.unsqueeze(0).to(self.vae.device))
-            else:
-                assert False
-
         with torch.no_grad():
-            # org
-            imageOrgDist = self.vae.encode(imageOrg).latent_dist
-            imageOrgMode = imageOrgDist.mode()
-            imageOrgSample = imageOrgDist.sample().mul_(self.vae.config.scaling_factor)
-            imageOrgMode = imageOrgMode.squeeze(0)
-            imageOrgSample = imageOrgSample.squeeze(0)
-            # flip
-            imageOrgFlipDist = self.vae.encode(imageOrgFlip).latent_dist
-            imageOrgFlipMode = imageOrgFlipDist.mode()
-            imageOrgFlipSample = imageOrgFlipDist.sample().mul_(self.vae.config.scaling_factor)
-            imageOrgFlipMode = imageOrgFlipMode.squeeze(0)
-            imageOrgFlipSample = imageOrgFlipSample.squeeze(0)
-            for i  in range(len(imageRayTraces)):
-                latent = self.vae.encode(imageRayTraces[i]).latent_dist.mode() #sample().mul_(self.vae.config.scaling_factor)
-                imageRayTraces[i] = latent.squeeze(0)
-        # 0-same (may be used for image enhacements)
-        # 1-move back
-        # 2-rotup 5
-        # 3-rotdn 5
-        # 4-strafe_r
-        # 5-strafe_l
-        ops = [1,2,3,4,5]
-        
-        # same
-        # may be augment with flip
-        # seems like it may add x4-5 more variations
-        example2 = {}
-        example2["target"] = imageOrgSample
-        example2["org"] = imageOrgMode
-        example2["class_id"] = 0
-        batch.append(example2)
-        # flipped
-        example2 = {}
-        example2["target"] = imageOrgFlipSample
-        example2["org"] = imageOrgFlipMode
-        example2["class_id"] = 0
-        batch.append(example2)
+            if index==0:
+                self.index_shuf = list(range(len(self.items)*self.numOps))
+                shuffle(self.index_shuf)
 
-        for i  in range(len(imageRayTraces)):
+            batch = []
+            img_idx = index % (len(self.items)*self.numOps)
+            img_idx = self.index_shuf[img_idx]
+            img_idxBase = img_idx//self.numOps
+            if img_idxBase in self.cache:
+                return self.cache[img_idxBase][img_idx%self.numOps]
+            
+            imageOrgMode,imageOrgSample = self.getLatents(self.items[img_idxBase]+".png")
+            imageOrgFlipMode,imageOrgFlipSample = self.getLatents(self.items[img_idxBase]+".png",True)
+
+            basePath = Path(self.items[img_idxBase]+".png").with_suffix('')
+            outs = []
+            outs.append(str(basePath.parent/"05FW"/basePath.name)+"_raytrace.png")
+            outs.append(str(basePath.parent/"5DN"/basePath.name)+"_5DN_rti.png")
+            outs.append(str(basePath.parent/"5UP"/basePath.name)+"_5UP_rti.png")
+            outs.append(str(basePath.parent/"05SL"/basePath.name)+"_05SL_rti.png")
+            outs.append(str(basePath.parent/"05SR"/basePath.name)+"_05SR_rti.png")
+            outs.append(str(basePath.parent/"AUG1"/basePath.name)+"_1_blur.png")
+            outs.append(str(basePath.parent/"AUG1"/basePath.name)+"_1_jpeg.png")
+            outs.append(str(basePath.parent/"AUG1"/basePath.name)+"_1_noise.png")
+            outs.append(str(basePath.parent/"AUG1"/basePath.name)+"_1_seg.png")
+            outs.append(str(basePath.parent/"AUG1"/basePath.name)+"_1_ds2.png")
+            outs.append(str(basePath.parent/"05RL"/basePath.name)+"_rti.png")
+            outs.append(str(basePath.parent/"05RR"/basePath.name)+"_rti.png")
+            imageRayTraces = []
+            for out in outs:
+                if os.path.exists(out):
+                    lat_mode,_ = self.getLatents(out)
+                    imageRayTraces.append(lat_mode)
+                else:
+                    print("File not found:"+out)
+                    imageRayTraces.append(imageOrgMode)
+
+            # 0-same (may be used for image enhacements)
+            # 1-move back
+            # 2-rotup 5
+            # 3-rotdn 5
+            # 4-strafe_r
+            # 5-strafe_l
+            # 6- real gen - inputs are zeros
+            # 7 - segmentation ada
+            # 8 - deblur downsamples 2x
+            # 9 - rotate left 
+            # 10 - rotate right
+            ops = [1,2,3,4,5,0,0,0,7,8,9,10]
+            
+            # same
+            # may be augment with flip
+            # seems like it may add x4-5 more variations
             example2 = {}
             example2["target"] = imageOrgSample
-            example2["org"] = imageRayTraces[i]
-            example2["class_id"] = ops[i]
+            example2["org"] = imageOrgMode
+            example2["class_id"] = 0
+            batch.append(example2)
+            # flipped
+            example2 = {}
+            example2["target"] = imageOrgFlipSample
+            example2["org"] = imageOrgFlipMode
+            example2["class_id"] = 0
             batch.append(example2)
 
-        self.cache[img_idxBase] = batch
+            # flipped
+            example2 = {}
+            example2["target"] = imageOrgSample
+            if self.zero_img==None:
+                self.zero_img = torch.zeros_like(imageOrgSample).to(self.vae.device)
+            example2["org"] = self.zero_img
+            example2["class_id"] = 6
+            batch.append(example2)
 
-        return batch[img_idx%self.numOps]
+            for i  in range(len(imageRayTraces)):
+                example2 = {}
+                example2["target"] = imageOrgSample
+                example2["org"] = imageRayTraces[i]
+                example2["class_id"] = ops[i]
+                batch.append(example2)
+
+            self.cache[img_idxBase] = batch
+
+            return batch[img_idx%self.numOps]
 
 
 def setup_mixed_precision(args):
@@ -703,6 +740,29 @@ def main(args):
                 dist.barrier()
                 logger.info(f"Saved training arguments to {checkpoint_path}.")
 
+            if ((step + 1) % 5000)==0:
+                print("validation begin")
+                sampler = SamplePipeline.SamplePipeline(ckpt=args.results_dir+"/checkpoints/",initMP=False)
+
+                classes = [0,1,2,5,6,8]
+
+                image_save_path=args.results_dir
+
+                for class_label in classes:
+                    shutil.copy("D:/Projects/sdexperiments/PointsInpaint/Test1/river19_0000_0002.png",image_save_path+f"/sample_{sampler.train_steps}_{class_label}_0.png")
+                    #shutil.copy("D:/Projects/InpaintDataBase/Batch3D_002/river98_0001.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+                    
+                    #shutil.copy("results/testNoise.png",image_save_path+f"/sample_{sampler.train_steps}_{class_label}_0.png")
+                    #shutil.copy("D:/Projects/InpaintDataBase/Batch3D_002/05SL/river75_0008_05SL_rti.png",args.image_save_path+f"/sample_{train_steps}_{args.class_labels[0]}_0.png")
+                    
+                    for i in range(10):
+                        imageFile = image_save_path+f"/sample_{sampler.train_steps}_{class_label}_{i}.png"
+                        image = sampler.sample(imageFile,class_label,seed=i)
+                        image.save(image_save_path+f"/sample_{sampler.train_steps}_{class_label}_{i+1}.png")
+
+                del sampler
+                print("validation done")
+
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -717,15 +777,17 @@ if __name__ == "__main__":
                     "--data_path=D:/Projects/InpaintDataBase/Batch3D_001",
                     #"--results_dir=./results",
                     #"--model=DiT_Llama_7B_patch2_Actions",
-                    "--results_dir=./results2",
-                    "--model=DiT_Llama_600_patch2_Actions2",
+                    "--results_dir=./results3",
+                    "--model=DiT_Llama_600_patch2_Actions3",
+                    #"--results_dir=./results2",
+                    #"--model=DiT_Llama_600_patch2_Actions2",
                     "--image_size=512",
                     "--vae=mse",
                     "--num_workers=1",
-                    "--log_every=5",
-                    "--ckpt_every=100",
-                    "--global_batch_size=32", #10",
-                    "--micro_batch_size=32",
+                    "--log_every=1",
+                    "--ckpt_every=200",
+                    "--global_batch_size=32", #38", #32 
+                    "--micro_batch_size=32", #38", # 32
                     #"--resume",
                     "--num_classes=100",
                     "--snr_type=lognorm",
